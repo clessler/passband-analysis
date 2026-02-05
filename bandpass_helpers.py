@@ -11,6 +11,271 @@ k = 1.38e-23   # boltzman constant
 c = 3e8     # speed of light
 
 
+###############################################################################
+# Functions for the Porter/Tanner way of processing interferograms to create
+# noise that is NOT positive defintie and averages down more nicely.
+###############################################################################
+def parabola_vertex_offset(y_m1, y_0, y_p1):
+    """
+    Parabolic peak location (sub-sample) using three points:
+    (-1,y_m1),(0,y_0),(+1,y_p1). Returns offset in samples.
+    """
+    denom = (y_m1 - 2*y_0 + y_p1)
+    if denom == 0:
+        return 0.0
+    return 0.5 * (y_m1 - y_p1) / denom
+
+
+def extract_symmetric_window(y, center_idx):
+    # center idx is the index we want to take around, take half samples from
+    # left (not including center) and half samples from right
+    x = np.arange(len(y))
+    len_x_smaller = min((len(np.where(x >= center_idx)[0]), len(np.where(
+        x < center_idx)[0])))
+    k = x[center_idx - len_x_smaller : center_idx + len_x_smaller] - center_idx
+    return k, y[center_idx - len_x_smaller : center_idx + len_x_smaller]
+
+
+def left_ramp_window(k, L1, beta):
+    # zero at x = -L1, 1/2 at x = beta, and 1 at x = L1 + 2 beta
+    # assume delta = 1 here
+    ramp = np.ones(len(k))
+    slope = (0.5) / (beta + L1)
+    points = np.arange(len(k))
+    ramp = (points * slope)
+    ramp[ramp > 1] = 1
+    return ramp
+
+def right_ramp_window(k, L2, beta):
+    # zero at x = L2, 1/2 at x = beta, and 1 at x = -L2 + 2 beta
+    # assume delta = 1 here
+    ramp = np.ones(len(k))
+    slope = (0.5) / (L2 + beta - 1)
+    points = np.arange(len(k))[::-1]
+    ramp = (points * slope)
+    ramp[ramp > 1] = 1
+    return ramp
+
+
+def weighted_linear_fit(x, y, w):
+    """
+    Weighted least squares for y ~ a + b*x.
+    Returns a,b
+    """
+    x = np.asarray(x); y = np.asarray(y); w = np.asarray(w)
+    X = np.vstack([np.ones_like(x), x]).T
+    W = np.diag(w)
+    beta = np.linalg.solve(X.T @ W @ X, X.T @ W @ y)
+    return beta[0], beta[1]
+
+
+def setup_fft_array_porter_tanner(x, y, x0, M):
+    """
+    Implements the ordering described in their Step 6 / Section V.B:
+    - first element is the first point with x >= x0
+    - follow with increasing x (positive side)
+    - then the negative side points go at the top (end) of the array
+    - zeros fill the gap between last positive and first negative in the circular sense
+
+    Assumes x is a 1D array of sampled positions, sorted increasing.
+    """
+    if M < len(y):
+        raise ValueError("M < len(y), please increase M")
+    yM = np.zeros(M, dtype=float)
+
+    # Indices for x >= x0 and x < x0
+    pos = np.where(x >= x0)[0]
+    neg = np.where(x <  x0)[0]
+
+    # Put positive side at the front, in order
+    y_pos = y[pos]
+    npos = min(len(y_pos), M)
+    yM[:npos] = y_pos[:npos]
+
+    # Put negative side at the end, in order (increasing x, so "closest below
+    # x0" ends up last)
+    y_neg = y[neg]
+    nneg = min(len(y_neg), M - npos)
+    if nneg > 0:
+        # keep the last nneg neg points (closest to x0 at the end)
+       yM[M - nneg:] = y_neg[-nneg:]
+
+    return yM
+
+
+def centered_hann(x, center_val=0):
+    len_x_larger = max((len(np.where(x > center_val)[0]), len(np.where(
+        x < center_val)[0])))
+    window = 0.5 * (1 + np.cos(2 * np.pi * (x - center_val) / (2 * len_x_larger)))
+    return window
+
+
+def centered_triangle(x, center_val=0):
+    max_endpoint = max((x[0], x[-1]), key=lambda x: np.abs(x - center_val))
+    window = 1 - np.abs(x - center_val) / np.abs(max_endpoint - center_val)
+    return window
+
+
+def apodize_interferogram(x, interferogram, center_val=0,
+                          window_func=centered_hann):
+    window = window_func(x, center_val=center_val)
+    return interferogram * window
+
+
+def pack_forman(y_win, k, M):
+    """
+    Pack measured interferogram points into an M-length FFT input array,
+    following Forman / Porter-Tanner:
+
+      - put x >= 0 (k >= 0) first, in increasing k
+      - then zeros
+      - then x < 0 (k < 0) at the END, in increasing k (so last sample is k=-1)
+
+    This reproduces their Fig. 5 ordering.
+    """
+    if M < len(y_win):
+        raise ValueError("M < len(y), please increase M")
+    y_fft = np.zeros(M, dtype=float)
+
+    pos = k >= 0
+    neg = k < 0
+
+    y_pos = y_win[pos]         # k = 0..(right-1)
+    y_neg = y_win[neg]         # k = -left..-1 (in increasing k order)
+
+    # place positive side at start
+    y_fft[:len(y_pos)] = y_pos
+
+    # place negative side at end: positions [M-left : M]
+    y_fft[M-len(y_neg):] = y_neg
+
+    return y_fft
+
+def normalize(x):
+    return x / np.max(x)
+
+
+def porter_tanner_method_correct(
+        orig_off_center_interferogram, debug=False, M=None, apodize=True,
+        apod_func=centered_hann):
+    if M is None:
+        M = len(orig_off_center_interferogram)
+    # I think we should do this assuming we know what zero is. which, it is
+    # always measured. But ugh it really shouldn't matter.
+    y_win = orig_off_center_interferogram - np.mean(
+        orig_off_center_interferogram)
+    max_ind = int(np.argmax(y_win))
+    off = parabola_vertex_offset(y_win[max_ind-1], y_win[max_ind], y_win[
+        max_ind+1])
+    beta_prime = int(np.ceil(max_ind + off))
+    if debug:
+        print("parabola offset = ", off)
+
+    n_right = len(y_win) - beta_prime
+    n_left = beta_prime
+    assert n_left + n_right == len(y_win)
+    # setup k so that k = 0 is the max ind
+    k = np.arange(-n_left, n_right)
+    if debug:
+        print("k[ceil(beta prime)] = ", k[beta_prime])
+        print("n left = ", n_left, ", n right = ", n_right)
+        plt.plot(k, y_win)
+        plt.xlim(-2, 2)
+        plt.show()
+
+    # ---- Step 4: pick out short 2-sided interferogram around beta' ----
+    # UPDATE: change this in case beta' < 0
+    if debug:
+        print(f'beta_prime: {beta_prime}')
+
+    k_phase, y_phase = extract_symmetric_window(y_win, beta_prime)
+    if debug:
+        print(np.min(k_phase))
+        print(np.max(k_phase))
+        print(len(k_phase))
+        plt.plot(k_phase, y_phase, marker='.')
+        plt.show()
+
+    # Step 6: make M-point array (Forman ordering) for the short interferogram
+    y_phase_fft = pack_forman(y_phase, k_phase, M)
+    if debug:
+        print("first element of format phase = ", y_phase_fft[0])
+        print("last element of format phase = ", y_phase_fft[-1])
+
+    # ---- Step 7: FFT -> low-res complex spectrum ----
+    Y_phase = np.fft.fft(y_phase_fft)
+
+    freq = np.fft.fftfreq(M)        # cycles per x-unit
+    omega = 2*np.pi*freq
+
+    # ---- Step 8: amplitude/phase; fit linear phase phi = a + b*omega ----
+    amp = normalize(np.abs(Y_phase))
+    phi = (np.angle(Y_phase))
+
+    amp_thresh = 0.5
+    omega_min = 0.3
+
+    good = (amp > (amp_thresh * amp.max())) & (omega >= omega_min)
+
+    if debug:
+        plt.plot(omega[good], amp[good])
+        plt.axhline(amp_thresh, color="black", ls="--")
+        plt.show()
+    a_fit, b_fit = weighted_linear_fit(omega[good], phi[good], amp[good] ** 2)
+    if debug:
+        print("a fit = ", a_fit, "b fit = ", b_fit)
+        plt.plot(omega[good], phi[good], '.')
+        plt.plot(omega, a_fit + b_fit * omega)
+        plt.show()
+
+    epsilon_est = b_fit
+    beta = epsilon_est
+    if n_left <= n_right:
+        A_ramp = left_ramp_window(k, n_left, beta=(k[beta_prime] - beta))
+    else:
+        A_ramp = right_ramp_window(k, n_right, beta=(k[beta_prime] - beta))
+    if debug:
+        print("ramp at k = 0 = ", A_ramp[beta_prime])
+    y_ramp = y_win * A_ramp
+
+    if apodize:
+        y_ramp = apodize_interferogram(k, y_ramp, window_func=apod_func)
+
+    if debug:
+        plt.plot(k, y_win / np.max(y_win))
+        plt.plot(k, A_ramp, color="orange", marker='.')
+        plt.axhline(0.5, color="black", ls="--")
+        plt.xlim(-3, 3)
+        plt.show()
+
+    yM_full = setup_fft_array_porter_tanner(k, y_ramp, x0=0, M=M)
+    if debug:
+        print("first element of forman fft = ", yM_full[0])
+        print("last element of forman fft = ", yM_full[-1])
+
+    # Step 12: FFT -> complex spectrum P1 + i P2
+    P_full = np.fft.fft(yM_full)
+
+    freq = np.fft.fftfreq(M)        # cycles per x-unit
+    omega = 2*np.pi*freq
+    phi = np.angle(P_full)
+    if debug:
+        plt.plot(omega, phi, '.')
+        plt.plot(omega, a_fit + b_fit * omega)
+        plt.show()
+
+    # Step 13: Phase corrected spectrum: Re{ exp(-i phi_est) * (P1+iP2) }
+    # Need phase at every bin. Use the fitted line as phi_est(omega).
+    # a_fit, b_fit = 0, 0.1
+    phi_est = a_fit + b_fit * omega
+    p_corr = np.real(np.exp(-1j*phi_est) * P_full)
+    if debug:
+        plt.plot(omega, p_corr)
+        # plt.xlim(0, None)
+        plt.show()
+    return p_corr
+
+
 def smart_rms(timeseries, n_iters, threshold, return_data=False):
     '''a function that calcualte the RMS after eliminating outliers
     timeseries: timestream'''
@@ -641,7 +906,8 @@ def get_passband(interferogram, fts_stage_step_size, fts_frequency_cal,
                  correction_func=None, correction_params=[], max_ind=None,
                  subtract_mean=True, edge_power_limit=.05, normalize=True,
                  amplitude_transfer_func=None, interp_freqs=None,
-                 transfer_func_edges=(None, None)):
+                 transfer_func_edges=(None, None), apply_porter_phase=False,
+                 **porter_kwargs):
     if (max_ind is None):
         max_ind = np.argmax(interferogram)  # results may vary...
     # phase_corrected_passband = phase_correct_interferogram(
@@ -653,9 +919,13 @@ def get_passband(interferogram, fts_stage_step_size, fts_frequency_cal,
         interferogram, n_rms_iters, spike_threshold, poly_order,
         polyfit=True)
 
-    window = make_triangle_window(corrected_interferogram)
-    phase_corrected_passband = invert_interferogram(corrected_interferogram,
-                                                    window)
+    if not apply_porter_phase:
+        window = make_triangle_window(corrected_interferogram)
+        phase_corrected_passband = invert_interferogram(corrected_interferogram,
+                                                        window)
+    else:
+        phase_corrected_passband = porter_tanner_method_correct(
+            corrected_interferogram, **porter_kwargs)
 
     # make a frequency axis and apply corrections
     frequency_hz = frequency(phase_corrected_passband,
