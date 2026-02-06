@@ -927,8 +927,8 @@ def get_passband(interferogram, fts_stage_step_size, fts_frequency_cal,
         try:
             phase_corrected_passband = porter_tanner_method_correct(
                 corrected_interferogram, **porter_kwargs)
-        except np.linalg.LinAlgError:
-            print("lin alg error for porter phase..")
+        except Exception as e:
+            print("Exception: ", e)
             window = make_triangle_window(corrected_interferogram)
             phase_corrected_passband = invert_interferogram(
                 corrected_interferogram, window)
