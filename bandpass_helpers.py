@@ -962,6 +962,13 @@ def get_passband(interferogram, fts_stage_step_size, fts_frequency_cal,
     noise_start_index = find_freq(frequency_hz, noise_bounds[0])
     noise_end_index = find_freq(frequency_hz, noise_bounds[1])
     # subtract a mean baseline from the band
+
+    # calculate the SNR-- use the absolute value for this to keep comparable to
+    # non phase corrected
+    snr = np.around(
+        1 / np.std(abs(normalize_passband(passband, lower_index=bin_min)[
+            noise_start_index:])), decimals=1)
+
     if (subtract_mean):
         passband = passband - np.mean(passband[
             noise_start_index:noise_end_index])
@@ -989,9 +996,6 @@ def get_passband(interferogram, fts_stage_step_size, fts_frequency_cal,
         passband = interpolation_func(interp_freqs)
         frequency_hz = interp_freqs
 
-    # calculate the SNR
-    snr = np.around(
-        1 / np.std(normed_passband[noise_start_index:]), decimals=1)
     return passband, cf, bw, snr, lower_edge, upper_edge, frequency_hz
 
 
