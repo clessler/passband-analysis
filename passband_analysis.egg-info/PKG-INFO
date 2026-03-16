@@ -1,0 +1,7 @@
+Metadata-Version: 2.1
+Name: passband-analysis
+Version: 0.0.1
+Summary: functions for processing and analyzing spectra measurements
+Author: Tommy Alford
+Author-email: tdalford1@gmail.com
+License: MIT
